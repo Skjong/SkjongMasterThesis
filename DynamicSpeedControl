@@ -1,0 +1,213 @@
+#ifndef RPM_TO_PWM_H
+#define RPM_TO_PWM_H
+
+#include "Arduino.h"
+#include <math.h>
+
+// Motor control pins
+#define MOTOR_PWM_L 33
+#define MOTOR_DIR_L 27
+#define MOTOR_PWM_R 32
+#define MOTOR_DIR_R 22
+#define BRAKE_PIN 26
+
+
+// Feedback
+extern float RPM_L;
+extern float RPM_R;
+
+//Slope detection
+const float downhillThreshold = -3.0f;
+const float downhillHysteresis = 1.5f;
+static bool slopeBraking = false;
+
+// Shared control variables
+float autoPWM = 0;
+float avgRPM = 0;
+float prevRPM = 0;
+float deltaRPM = 0;
+float rpmAccel = 0;
+unsigned long lastUpdate = 0;
+bool isCoasting = false;
+bool isBraking = false;
+extern bool userDetected;
+
+// Falling variables
+bool fallDetected = false;
+unsigned long fallHoldUntil = 0;
+const unsigned long fallHoldDuration = 2000;  // ms
+
+// PID state (external, declared in pid.ino)
+extern float integral_L;
+extern float integral_R;
+extern float previousError_L;
+extern float previousError_R;
+extern float holdPWM_L;
+extern float holdPWM_R;
+extern float  outputPWM_L;
+extern float  outputPWM_R;
+
+
+void setupPWMControl() {
+    pinMode(MOTOR_PWM_L, OUTPUT);
+    pinMode(MOTOR_DIR_L, OUTPUT);
+    pinMode(MOTOR_PWM_R, OUTPUT);
+    pinMode(MOTOR_DIR_R, OUTPUT);
+    pinMode(BRAKE_PIN, OUTPUT);
+    digitalWrite(BRAKE_PIN, HIGH);
+}
+
+void assistRampLogic() {
+    unsigned long now = millis();
+    float dt = (now - lastUpdate) / 1000.0f;
+    lastUpdate = now;
+
+    avgRPM = (RPM_L + RPM_R) * 0.5f;
+    deltaRPM = avgRPM - prevRPM;
+    rpmAccel = deltaRPM / dt;
+
+    isBraking = false;
+
+    if (slopeBraking) {
+    if (pitch > downhillThreshold + downhillHysteresis) {
+        slopeBraking = false;
+    }
+} else {
+    if (pitch < downhillThreshold) {
+        slopeBraking = true;
+    }
+}
+
+    // Detect fall
+    if (avgRPM > 35.0f && rpmAccel > 85.0f) {
+        fallDetected = true;
+        fallHoldUntil = millis() + fallHoldDuration;
+    }
+
+    if (fallDetected && millis() > fallHoldUntil) {
+        fallDetected = false;
+        integral_L = 0;
+        integral_R = 0;
+        previousError_L = 0;
+        previousError_R = 0;
+        holdPWM_L = 0;
+        holdPWM_R = 0;
+        outputPWM_L = 0;
+        outputPWM_R = 0;
+        autoPWM = 0;
+    }
+
+    // --- Safety control when user not detected ---
+if (!userDetected) {
+    // Force braking through brake pin
+    digitalWrite(BRAKE_PIN, LOW);
+    autoPWM = 0.0f;
+    analogWrite(MOTOR_PWM_L, 0);
+    analogWrite(MOTOR_PWM_R, 0);
+    return;
+}
+
+// --- Lock via PID only during fall ---
+if (millis() < fallHoldUntil) {
+    digitalWrite(BRAKE_PIN, HIGH); // allow motors to control
+    autoPWM = 0.0f;
+    setpointRPM_L = 0;
+    setpointRPM_R = 0;
+    updatePID();
+    return;
+}
+
+    float rpmDiff = abs(RPM_L - RPM_R);
+    bool isTurning = rpmDiff > 20.0f;
+    if (isTurning) {
+        autoPWM *= 0.3f;
+    }
+
+    const float minMovementRPM = 15.0f;
+    float maxPWM = 50.0f;
+    const float decelerationRate = 25.0f;
+    const float coastingPauseInterval = 1.0f;
+    static float coastingTimer = 0.0f;
+
+    // === Downhill braking ===
+    if (slopeBraking) {
+    digitalWrite(BRAKE_PIN, LOW);  // Force brake pin HIGH
+    autoPWM = 0.0f;
+    analogWrite(MOTOR_PWM_L, 0);  // Actively stop PWM
+    analogWrite(MOTOR_PWM_R, 0);
+    isBraking = true;
+} else {
+    digitalWrite(BRAKE_PIN, HIGH);
+    isBraking = false;
+}
+
+    // === Uphill assist ===
+    if (pitch > 5.0f && avgRPM > minMovementRPM) {
+        maxPWM = map(pitch, 5.0f, 15.0f, 50.0f, 70.0f);
+        maxPWM = constrain(maxPWM, 50.0f, 70.0f);
+        float baseTargetPWM = map(avgRPM, minMovementRPM, 50.0f, 22.0f, maxPWM);
+        baseTargetPWM = constrain(baseTargetPWM, 20.0f, maxPWM);
+
+        float slopeBoost = map(pitch, 5.0f, 15.0f, 10.0f, 35.0f);
+        slopeBoost = constrain(slopeBoost, 0.0f, 35.0f);
+
+        float targetPWM = baseTargetPWM + slopeBoost;
+        if (pitch > 10.0f && avgRPM < 15.0f) {
+            targetPWM += 8.0f;
+        }
+
+        float alpha = 0.4f;
+        autoPWM = (1.0f - alpha) * autoPWM + alpha * targetPWM;
+
+        coastingTimer += dt;
+        if (coastingTimer >= coastingPauseInterval && abs(deltaRPM) < 1.2f) {
+            isCoasting = true;
+            coastingTimer = 0.0f;
+        }
+
+        if (isCoasting) {
+            autoPWM *= 0.7f;
+            if (deltaRPM < -1.0f || avgRPM < minMovementRPM * 0.8f) {
+                autoPWM = 0.0f;
+            }
+            isCoasting = false;
+        }
+    }
+    
+
+    // === Flat ground assist ===
+    if (avgRPM > minMovementRPM && pitch >= -3.0f) {
+        float targetPWM = map(avgRPM, minMovementRPM, 50.0f, 18.0f, maxPWM);
+        targetPWM = constrain(targetPWM, 15.0f, maxPWM);
+
+        float alpha = 0.4f;
+        autoPWM = (1.0f - alpha) * autoPWM + alpha * targetPWM;
+
+        coastingTimer += dt;
+        if (coastingTimer >= coastingPauseInterval && abs(deltaRPM) < 1.2f) {
+            isCoasting = true;
+            coastingTimer = 0.0f;
+        }
+
+        if (isCoasting) {
+            autoPWM *= 0.85f;
+            if (deltaRPM < -1.0f || avgRPM < minMovementRPM * 0.8f) {
+                autoPWM = 0.0f;
+            }
+            isCoasting = false;
+        }
+    } else {
+        autoPWM -= decelerationRate * dt;
+    }
+
+    autoPWM = constrain(autoPWM, 0.0f, maxPWM);
+    prevRPM = avgRPM;
+
+    digitalWrite(MOTOR_DIR_L, HIGH);
+    digitalWrite(MOTOR_DIR_R, LOW);
+    analogWrite(MOTOR_PWM_L, (uint8_t)autoPWM);
+    analogWrite(MOTOR_PWM_R, (uint8_t)autoPWM);
+}
+
+
+#endif
