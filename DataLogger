@@ -1,0 +1,82 @@
+#ifndef LOGGER
+#define LOGGER
+
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+BLECharacteristic* pCharacteristic;
+bool deviceConnected = false;
+
+extern float RPM_L;
+extern float RPM_R;
+extern float avgRPM;
+extern float autoPWM;
+extern float load1;
+extern float load2;
+extern float pitch;
+extern float outputPWM_L;
+extern float outputPWM_R;
+extern bool isBraking;
+
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    deviceConnected = true;
+    Serial.println("Client connected.");
+  }
+  void onDisconnect(BLEServer* pServer) {
+    deviceConnected = false;
+    Serial.println("Client disconnected.");
+    pServer->startAdvertising();
+  }
+};
+
+void setupLogger() {
+  Serial.begin(115200);
+
+  BLEDevice::init("RollatorLogger");
+  BLEServer* pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService* pService = pServer->createService("6e400001-b5a3-f393-e0a9-e50e24dcca9e");
+
+  pCharacteristic = pService->createCharacteristic(
+  "6e400003-b5a3-f393-e0a9-e50e24dcca9e",
+  BLECharacteristic::PROPERTY_NOTIFY
+);
+pCharacteristic->addDescriptor(new BLE2902());
+
+// Optional, to hint it's string data:
+pCharacteristic->setValue("Ready");
+
+
+  pService->start();
+  pServer->getAdvertising()->start();
+
+  Serial.println("BLE logger ready.");
+  Serial.println("----- NEW SESSION -----");
+}
+
+void updateLogger() {
+  static unsigned long lastSend = 0;
+  if (!deviceConnected) return;
+
+  if (millis() - lastSend > 250) {
+    lastSend = millis();
+
+    String payload = String(millis()) + "," +
+                     String(avgRPM, 2) + "," +
+                     String(autoPWM, 2) + "," +
+                     String(outputPWM_L, 2) + "," + //Only included when showcasing emergency braking
+                     String(outputPWM_R, 2) + "," + //Only included when showcasing emergency braking
+                     String(int(pitch)) + "," +
+                     String(int(load1)) + "," +
+                     String(int(load2));
+
+    pCharacteristic->setValue(payload);  // <- CORRECT way
+pCharacteristic->notify();
+  }
+}
+
+#endif
