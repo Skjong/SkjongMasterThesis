@@ -101,7 +101,7 @@ void updateUserInput() {
     // --- New: Cross-verification timers ---
     static unsigned long lastBodyTime = 0;
     static unsigned long lastHandsTime = 0;
-    const unsigned long maxSensorSilence = 30000;  // 5s timeout
+    const unsigned long maxSensorSilence = 5000;  // 5s timeout
 
     if (bodyDetected) lastBodyTime = millis();
     if (handDetected) lastHandsTime = millis();
